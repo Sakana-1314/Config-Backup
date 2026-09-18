@@ -2,8 +2,8 @@
 set -euo pipefail
 
 URL="https://proxy.19890605.xyz/raw.githubusercontent.com/YangRucheng/Config-Backup/refs/heads/main/resource"
+NEW_HOSTNAME="Host"
 
-# 静默下载：-q 关闭进度条、网络重定向等冗余输出，只保留错误信息
 fetch() {
   wget -q --tries=10 -O "$2" "$1" || {
     echo "[!] 下载失败: $1" >&2
@@ -36,12 +36,34 @@ echo "    完成: ~/.ssh/authorized_keys"
 
 echo "==> 设置主机名"
 source ~/.bashrc
-echo "Host" > /etc/hostname
-hostname Host
-# 写入主机名解析（127.0.1.1 是 Debian/Ubuntu 的主机名解析惯例）
-sed -i "/^127\.0\.1\.1[[:space:]]\+/d" /etc/hosts
-echo "127.0.1.1 Host" >> /etc/hosts
-echo "    完成: 主机名已设置为 Host，并写入 /etc/hosts 解析"
+OLD_HOSTNAME="$(hostname)"
+printf '%s\n' "$NEW_HOSTNAME" > /etc/hostname
+
+if [ -n "$OLD_HOSTNAME" ] && [ "$OLD_HOSTNAME" != "$NEW_HOSTNAME" ]; then
+  HOSTS_TMP="$(mktemp)"
+  awk -v old="$OLD_HOSTNAME" -v new="$NEW_HOSTNAME" '
+    {
+      out = ""
+      pos = 1
+      for (i = 1; i <= NF; i++) {
+        p = index(substr($0, pos), $i)
+        if (p == 0) break
+        s = pos + p - 1
+        out = out substr($0, pos, s - pos) ($i == old ? new : $i)
+        pos = s + length($i)
+      }
+      print out substr($0, pos)
+    }' /etc/hosts > "$HOSTS_TMP"
+  cat "$HOSTS_TMP" > /etc/hosts
+  rm -f "$HOSTS_TMP"
+fi
+
+if ! awk -v h="$NEW_HOSTNAME" '{ for (i = 1; i <= NF; i++) if ($i == h) found = 1 } END { exit !found }' /etc/hosts; then
+  printf '127.0.1.1\t%s\n' "$NEW_HOSTNAME" >> /etc/hosts
+fi
+
+hostname "$NEW_HOSTNAME"
+echo "    完成: 主机名已设置为 $NEW_HOSTNAME，/etc/hosts 中的旧主机名已全部替换"
 
 echo "==> 配置 SSH 允许 root 公钥登录"
 sed -i "s/#PermitRootLogin prohibit-password/PermitRootLogin yes/" /etc/ssh/sshd_config
