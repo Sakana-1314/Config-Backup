@@ -6,13 +6,7 @@ Wants=network-online.target
 [Service]
 TimeoutStartSec=15
 Type=simple
-ExecStart=/usr/bin/cloudflared tunnel \
-  --edge-ip-version auto \
-  --protocol quic \
-  --loglevel warn \
-  --no-autoupdate \
-  run \
-  --token __CLOUDFLARED_TOKEN__
+ExecStart=/usr/bin/cloudflared tunnel --edge-ip-version auto --protocol quic --loglevel warn --no-autoupdate run --token __CLOUDFLARED_TOKEN__
 Restart=on-failure
 RestartSec=5s
 

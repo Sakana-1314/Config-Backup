@@ -2,8 +2,9 @@
 
 set -euo pipefail
 
-API_URL="https://api.github.com/repos/cloudflare/cloudflared/releases/latest"
-GHFAST_PREFIX="https://ghfast.top/"
+API_URL="${API_URL:-https://api.github.com/repos/cloudflare/cloudflared/releases/latest}"
+PROXY_BASE="${PROXY_BASE:-https://proxy.19890605.xyz}"
+GHFAST_PREFIX="${GHFAST_PREFIX:-https://ghfast.top/}"
 ASSET_NAME="${ASSET_NAME:-}"
 RESTART_DELAY_SECONDS="${RESTART_DELAY_SECONDS:-10}"
 TMP_FILE=""
@@ -84,41 +85,268 @@ detect_cloudflared_asset_name() {
   esac
 }
 
+parse_release_asset() {
+  awk -v asset_name="${ASSET_NAME}" '
+    /^[[:space:]]*"name":[[:space:]]*"/ {
+      name = $0
+      sub(/^[[:space:]]*"name":[[:space:]]*"/, "", name)
+      sub(/",?[[:space:]]*$/, "", name)
+      matched = (name == asset_name)
+    }
+
+    matched && /^[[:space:]]*"digest":[[:space:]]*"/ {
+      digest = $0
+      sub(/^[[:space:]]*"digest":[[:space:]]*"/, "", digest)
+      sub(/",?[[:space:]]*$/, "", digest)
+    }
+
+    matched && /^[[:space:]]*"browser_download_url":[[:space:]]*"/ {
+      url = $0
+      sub(/^[[:space:]]*"browser_download_url":[[:space:]]*"/, "", url)
+      sub(/",?[[:space:]]*$/, "", url)
+      print url
+      print digest
+      found = 1
+    }
+
+    END {
+      if (!found) {
+        exit 1
+      }
+    }
+  '
+}
+
 fetch_latest_url() {
   local headers=(
     -H "Accept: application/vnd.github+json"
     -H "X-GitHub-Api-Version: 2022-11-28"
   )
+  local result
 
   if [ -n "${GITHUB_TOKEN:-}" ]; then
     headers+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
   fi
 
-  curl -fsSL --connect-timeout 15 --retry 3 \
+  if result="$(curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 \
+      "${headers[@]}" \
+      "${API_URL}" \
+      | parse_release_asset)"; then
+    printf '%s' "${result}"
+    return 0
+  fi
+
+  # 直连 api.github.com 拿到的 digest 才是独立可信的。
+  # 代理返回的 digest 与被下载的二进制来自同一个源，只能证明“代理自洽”，
+  # 不能作为独立的信任根；这里仍然用它，但明确告知这一点。
+  log_warn "直连 GitHub API 失败，改用代理 ${PROXY_BASE} 查询" >&2
+  log_warn "此时 digest 与二进制同源，仅能证明代理自洽；设置 GITHUB_TOKEN 可获得独立校验" >&2
+  curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 \
     "${headers[@]}" \
-    "${API_URL}" \
-    | awk -v asset_name="${ASSET_NAME}" '
-        /^[[:space:]]*"name":[[:space:]]*"/ {
-          name = $0
-          sub(/^[[:space:]]*"name":[[:space:]]*"/, "", name)
-          sub(/",?[[:space:]]*$/, "", name)
-          matched = (name == asset_name)
-        }
+    "$(proxy_url "${API_URL}")" \
+    | parse_release_asset
+}
 
-        matched && /^[[:space:]]*"browser_download_url":[[:space:]]*"/ {
-          url = $0
-          sub(/^[[:space:]]*"browser_download_url":[[:space:]]*"/, "", url)
-          sub(/",?[[:space:]]*$/, "", url)
-          print url
-          found = 1
-        }
+proxy_url() {
+  local target="${1#https://}"
+  target="${target#http://}"
+  printf '%s/%s' "${PROXY_BASE%/}" "${target}"
+}
 
-        END {
-          if (!found) {
-            exit 1
-          }
-        }
-      '
+is_allowed_target_host() {
+  case "${1#https://}" in
+    github.com/*|release-assets.githubusercontent.com/*|objects.githubusercontent.com/*|raw.githubusercontent.com/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+extract_proxy_target() {
+  local file="$1"
+  local url=""
+
+  if [ ! -f "${file}" ]; then
+    return 1
+  fi
+
+  url="$(sed -n 's/.*<div class="url">\([^<]*\)<.*/\1/p' "${file}" | head -n 1)"
+
+  if [ -z "${url}" ]; then
+    return 1
+  fi
+
+  # 注意：bash 5.2 起 ${var//pat/rep} 的 & 默认表示“匹配到的内容”，
+  # 这里必须加引号，否则 &amp; 不会被还原成 &
+  url="${url//'&amp;'/'&'}"
+
+  if ! is_allowed_target_host "${url}"; then
+    # 必须写 stderr：stdout 会被调用方的命令替换捕获
+    log_warn "代理返回了非 GitHub 域名，出于安全考虑忽略: ${url}" >&2
+    return 1
+  fi
+
+  printf '%s' "${url}"
+}
+
+is_elf_binary() {
+  local file="$1"
+  local magic
+
+  if [ ! -s "${file}" ]; then
+    return 1
+  fi
+
+  magic="$(head -c 4 "${file}" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [ "${magic}" = "7f454c46" ]
+}
+
+is_sha256_digest() {
+  case "$1" in
+    *[!0-9a-fA-F]*|"")
+      return 1
+      ;;
+  esac
+
+  [ "${#1}" -eq 64 ]
+}
+
+verify_sha256() {
+  local file="$1"
+  local expected="${2#sha256:}"
+  local actual
+
+  # 失败关闭：没有官方校验和时绝不放行，否则被污染的下载会直接覆盖 /usr/bin/cloudflared
+  if ! is_sha256_digest "${expected}"; then
+    log_warn "没有可用的官方 sha256 校验和，拒绝校验通过"
+    return 1
+  fi
+
+  actual="$(sha256sum "${file}" | awk '{print $1}')"
+
+  if [ "${actual}" != "${expected}" ]; then
+    log_warn "校验和不匹配: 期望 ${expected}，实际 ${actual}"
+    return 1
+  fi
+
+  log_info "sha256 校验通过: ${actual}"
+}
+
+verify_download() {
+  local file="$1"
+  local expected="$2"
+
+  if ! is_elf_binary "${file}"; then
+    log_warn "下载结果不是有效的 ELF 可执行文件"
+    return 1
+  fi
+
+  if is_sha256_digest "${expected#sha256:}"; then
+    verify_sha256 "${file}" "${expected}"
+    return
+  fi
+
+  # 没有官方校验和时默认拒绝，避免被污染的下载覆盖 /usr/bin/cloudflared。
+  # 确需在限流环境下升级时，可显式设置 ALLOW_UNVERIFIED_DOWNLOAD=1。
+  if [ "${ALLOW_UNVERIFIED_DOWNLOAD:-0}" = "1" ]; then
+    log_warn "ALLOW_UNVERIFIED_DOWNLOAD=1：跳过 sha256 校验，仅依据 ELF 头接受该文件"
+    return 0
+  fi
+
+  log_warn "没有官方 sha256 可核对，已中止；如需继续请设置 ALLOW_UNVERIFIED_DOWNLOAD=1"
+  return 1
+}
+
+download_and_verify() {
+  local origin="$1"
+  local out="$2"
+  local digest="$3"
+
+  if download_via_proxy "${origin}" "${out}"; then
+    if verify_download "${out}" "${digest}"; then
+      return 0
+    fi
+    log_warn "代理下载的文件未通过校验，改用 ghfast.top 重试"
+  else
+    log_warn "代理下载失败，改用 ghfast.top 重试"
+  fi
+
+  if download_via_ghfast "${origin}" "${out}"; then
+    if verify_download "${out}" "${digest}"; then
+      return 0
+    fi
+    log_warn "ghfast.top 下载的文件未通过校验"
+  fi
+
+  return 1
+}
+
+describe_url() {
+  local url="$1"
+  local host="${url#https://}"
+  local last
+
+  url="${url%%\?*}"
+  host="${host%%/*}"
+  last="${url##*/}"
+
+  printf '%s/.../%s' "${host}" "${last:0:48}"
+}
+
+download_via_proxy() {
+  local origin="$1"
+  local out="$2"
+  local candidate="${origin}"
+  local next
+  local attempt
+
+  for attempt in 1 2 3 4; do
+    log_info "代理请求 (${attempt}/4): $(describe_url "${candidate}")"
+
+    # 先删除旧文件：curl 连接失败或返回 304 时不会截断已存在的文件，
+    # 留下上一次的残留内容会绕过后续的 ELF 校验
+    rm -f "${out}" || true
+
+    if curl -fsSL --connect-timeout 15 --max-time 600 --retry 3 \
+      -o "${out}" \
+      "$(proxy_url "${candidate}")" && is_elf_binary "${out}"; then
+      return 0
+    fi
+
+    next="$(extract_proxy_target "${out}" || true)"
+
+    if [ -z "${next}" ]; then
+      log_warn "第 ${attempt} 次代理请求未返回可下载地址"
+      return 1
+    fi
+
+    if [ "${next}" = "${candidate}" ]; then
+      log_warn "代理地址未推进，停止重试: $(describe_url "${next}")"
+      return 1
+    fi
+
+    log_info "解析到下一跳: $(describe_url "${next}")"
+    candidate="${next}"
+  done
+
+  log_warn "代理下载重试次数已用尽"
+  return 1
+}
+
+download_via_ghfast() {
+  local origin="$1"
+  local out="$2"
+
+  log_warn "改用 ghfast.top 兜底下载"
+  log_info "加速链接: ${GHFAST_PREFIX}${origin}"
+
+  rm -f "${out}" || true
+
+  curl -fsSL --connect-timeout 15 --max-time 600 --retry 3 \
+    -o "${out}" \
+    "${GHFAST_PREFIX}${origin}" && is_elf_binary "${out}"
 }
 
 get_unit_fragment_path() {
@@ -343,6 +571,46 @@ prompt_for_service_token() {
   printf '%s' "${token}"
 }
 
+expected_template_hashes() {
+  printf '%s\n' \
+    "cloudflared@quic.service c01081b76f315d15527a2b1355766ef8a239aecea3dc3925edefdd071e05642a" \
+    "cloudflared@http2.service 70a7eba123d17ed8eae96065e14f8d6084e9d288b465f7c5f8beb638ca7849b0"
+}
+
+expected_template_hash() {
+  local unit="$1"
+
+  expected_template_hashes | awk -v u="${unit}" '$1 == u { print $2 }'
+}
+
+verify_template_hash() {
+  local file="$1"
+  local unit="$2"
+  local expected
+  local actual
+
+  expected="$(expected_template_hash "${unit}")"
+
+  # 失败关闭：没有内置指纹就不允许安装，避免有人往 SERVICE_UNITS 里加了新 unit
+  # 却忘了登记校验和时，指纹校验被静默跳过。
+  if [ -z "${expected}" ]; then
+    log_warn "没有 ${unit} 的内置校验和，拒绝安装（请先在脚本中登记其 sha256）"
+    return 1
+  fi
+
+  actual="$(sha256sum "${file}" | awk '{print $1}')"
+
+  if [ "${actual}" != "${expected}" ]; then
+    log_warn "${unit} 模板指纹与仓库内置值不一致"
+    log_warn "期望 ${expected}"
+    log_warn "实际 ${actual}"
+    log_warn "确认已更新仓库模板后再升级；本次拒绝安装该模板"
+    return 1
+  fi
+
+  log_info "${unit} 模板指纹校验通过"
+}
+
 render_service_template() {
   local token="$1"
 
@@ -362,6 +630,156 @@ render_service_template() {
   '
 }
 
+validate_unit_template() {
+  local file="$1"
+  local unit="$2"
+  local reason
+
+  # 模板来自同一个不可信代理，装到 /etc/systemd/system 后由 root 执行。
+  # systemd 指令面太大，黑名单无法穷尽（ExecStop / OnSuccess / Environment=LD_PRELOAD
+  # / StandardOutput=file:... 都能以 root 执行或写文件），因此改用严格白名单：
+  # 只允许固定段落与固定指令，且必须恰好有一条指向 ${TARGET} 的 ExecStart。
+  #
+  # 注意：这里刻意不支持行末续行（\）与注释。awk 的续行/注释处理与 systemd 自身
+  # 的解析器并不完全一致（例如 "\ " 结尾 systemd 不续行，注释里的 \ 也不续行），
+  # 任何分歧都能把 ExecStop= 之类的指令偷渡进白名单。直接禁止这两类语法即可
+  # 从根上消除该分歧，仓库内的模板也已改为单行 ExecStart。
+  reason="$(awk -v target="${TARGET}" -v placeholder="${TOKEN_PLACEHOLDER}" '
+    function fail(msg) {
+      print msg
+      bad = 1
+    }
+
+    function allowed(key, list) {
+      return index(" " list " ", " " key " ") > 0
+    }
+
+    {
+      logical[++total] = $0
+    }
+
+    END {
+      section = ""
+      exec_count = 0
+      has_token = 0
+
+      for (i = 1; i <= total; i++) {
+        line = logical[i]
+        sub(/\r$/, "", line)
+
+        if (line ~ /^[[:space:]]*$/) {
+          continue
+        }
+
+        if (line ~ /\\/) {
+          fail("不允许行末续行或反斜杠: " line)
+          continue
+        }
+
+        if (line ~ /#/) {
+          fail("不允许注释: " line)
+          continue
+        }
+
+        if (line ~ /^\[/) {
+          if (line !~ /^\[(Unit|Service|Install)\]$/) {
+            fail("不允许的段落: " line)
+            continue
+          }
+
+          if (seen[line]++) {
+            fail("段落重复: " line)
+          }
+
+          section = line
+          continue
+        }
+
+        if (line ~ /^[[:space:]]/) {
+          fail("指令不得缩进: " line)
+          continue
+        }
+
+        if (line !~ /=/) {
+          fail("不是 key=value: " line)
+          continue
+        }
+
+        key = line
+        sub(/=.*$/, "", key)
+        value = line
+        sub(/^[^=]*=/, "", value)
+
+        if (key !~ /^[A-Za-z][A-Za-z0-9]*$/) {
+          fail("指令名非法: " key)
+          continue
+        }
+
+        if (section == "[Unit]") {
+          if (!allowed(key, "Description After Wants")) {
+            fail("[Unit] 不允许的指令: " key)
+          }
+        } else if (section == "[Service]") {
+          if (!allowed(key, "TimeoutStartSec Type ExecStart Restart RestartSec")) {
+            fail("[Service] 不允许的指令: " key)
+          }
+
+          if (key == "Type" && value != "simple") {
+            fail("Type 只允许 simple，实际: " value)
+          }
+
+          if (key == "ExecStart") {
+            exec_count++
+
+            if (substr(value, 1, length(target)) != target) {
+              fail("ExecStart 未指向 " target)
+            } else if (substr(value, length(target) + 1, 1) != " ") {
+              fail("ExecStart 缺少参数")
+            } else if (value ~ /[`$|&;<>()]/) {
+              fail("ExecStart 含 shell 元字符")
+            }
+
+            if (index(value, placeholder) > 0) {
+              has_token = 1
+            }
+          }
+        } else if (section == "[Install]") {
+          if (!allowed(key, "WantedBy")) {
+            fail("[Install] 不允许的指令: " key)
+          }
+        } else {
+          fail("指令出现在任何段落之外: " key)
+        }
+      }
+
+      if (!seen["[Unit]"]) {
+        fail("缺少 [Unit] 段")
+      }
+
+      if (!seen["[Service]"]) {
+        fail("缺少 [Service] 段")
+      }
+
+      if (exec_count != 1) {
+        fail("必须恰好有一条 ExecStart，实际: " exec_count)
+      }
+
+      if (!has_token) {
+        fail("ExecStart 未包含 token 占位符 " placeholder)
+      }
+
+      exit bad ? 1 : 0
+    }
+  ' "${file}")" || {
+    if [ -n "${reason}" ]; then
+      while IFS= read -r line; do
+        [ -n "${line}" ] && log_warn "${unit} 模板校验失败: ${line}" >&2
+      done <<< "${reason}"
+    fi
+    return 1
+  }
+}
+
 install_cloudflared_service_units() {
   local unit
   local env_name
@@ -373,6 +791,10 @@ install_cloudflared_service_units() {
   log_step "3/7 同步 cloudflared systemd 服务文件"
 
   mkdir -p "${SERVICE_UNIT_DIR}"
+
+  # 两阶段：先把两个模板全部下载并校验，全部通过后才写入 SERVICE_UNIT_DIR。
+  # 这样任一模板失败都不会留下“一个已替换、一个未替换”的半成品状态。
+  local staged_templates=()
 
   for unit in "${SERVICE_UNITS[@]}"; do
     env_name="$(service_token_env_name "${unit}")"
@@ -395,9 +817,17 @@ install_cloudflared_service_units() {
     tmp_unit="$(make_tmp_file "${unit}")"
 
     log_info "下载模板到临时文件 ${tmp_template}"
-    curl -fsSL --connect-timeout 15 --retry 3 \
+    curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 \
       -o "${tmp_template}" \
       "${SERVICE_TEMPLATE_URL_BASE}/${unit}"
+
+    if ! verify_template_hash "${tmp_template}" "${unit}"; then
+      die "${unit} 模板指纹校验失败，已中止安装（如已更新仓库模板，请同步更新脚本内置校验和）"
+    fi
+
+    if ! validate_unit_template "${tmp_template}" "${unit}"; then
+      die "${unit} 模板未通过安全校验，已中止安装"
+    fi
 
     log_info "渲染服务文件 ${tmp_unit}"
     render_service_template "${token}" < "${tmp_template}" > "${tmp_unit}"
@@ -407,6 +837,14 @@ install_cloudflared_service_units() {
     fi
 
     chmod 0644 "${tmp_unit}"
+
+    staged_templates+=("${unit} ${tmp_unit}")
+  done
+
+  # 所有模板均已在临时目录中就绪，此处才真正写入
+  for entry in "${staged_templates[@]}"; do
+    unit="${entry%% *}"
+    tmp_unit="${entry#* }"
     target_path="${SERVICE_UNIT_DIR}/${unit}"
     log_info "更新 ${target_path}"
     mv -f "${tmp_unit}" "${target_path}"
@@ -453,7 +891,7 @@ schedule_cloudflared_restart() {
 }
 
 log_step "1/7 检查运行环境"
-require_commands curl awk grep systemctl systemd-run chmod mkdir mv rm mktemp sort uname
+require_commands curl awk grep sed systemctl systemd-run chmod mkdir mv rm mktemp sort uname sha256sum od
 log_info "依赖检查通过"
 
 if [ -z "${ASSET_NAME}" ]; then
@@ -482,17 +920,36 @@ remove_cloudflared_update_units
 
 install_cloudflared_service_units
 
-log_step "4/7 通过 GitHub API 获取最新 ${ASSET_NAME} 下载链接"
-ORIGIN_URL="$(fetch_latest_url)" || die "无法从 GitHub API 获取 ${ASSET_NAME} 下载链接"
-URL="${GHFAST_PREFIX}${ORIGIN_URL}"
+log_step "4/7 获取最新 ${ASSET_NAME} 下载链接"
+
+API_RESULT="$(fetch_latest_url || true)"
+ORIGIN_URL="$(printf '%s\n' "${API_RESULT}" | sed -n '1p')"
+EXPECTED_DIGEST="$(printf '%s\n' "${API_RESULT}" | sed -n '2p')"
+
+if ! is_sha256_digest "${EXPECTED_DIGEST#sha256:}"; then
+  EXPECTED_DIGEST=""
+fi
+
+if [ -z "${ORIGIN_URL}" ]; then
+  # GitHub API 未认证时经常限流；此时退回 canonical 的 latest 链接，
+  # 由代理逐跳解析出真实 tag，仍然可以完成下载（但没有官方校验和可核对）
+  ORIGIN_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/${ASSET_NAME}"
+  log_warn "未能通过 GitHub API 获取链接，退回 latest 链接: ${ORIGIN_URL}"
+fi
+
 log_info "原始链接: ${ORIGIN_URL}"
-log_info "加速链接: ${URL}"
+if [ -n "${EXPECTED_DIGEST}" ]; then
+  log_info "官方校验和: ${EXPECTED_DIGEST}"
+else
+  log_warn "本次拿不到官方 sha256；默认会拒绝安装，建议设置 GITHUB_TOKEN"
+  log_warn "如确需在限流环境下升级，可显式设置 ALLOW_UNVERIFIED_DOWNLOAD=1 跳过校验"
+fi
 
-log_step "5/7 下载最新 cloudflared"
+log_step "5/7 通过 ${PROXY_BASE} 下载最新 cloudflared"
 
-curl -L --fail --connect-timeout 15 --retry 3 \
-  -o "${TMP_FILE}" \
-  "${URL}"
+if ! download_and_verify "${ORIGIN_URL}" "${TMP_FILE}" "${EXPECTED_DIGEST}"; then
+  die "下载 ${ASSET_NAME} 失败或未通过校验（代理与 ghfast.top 均已尝试）"
+fi
 
 log_info "下载完成: ${TMP_FILE}"
 chmod +x "${TMP_FILE}"
