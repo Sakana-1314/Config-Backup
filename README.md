@@ -8,6 +8,12 @@
 wget -q -O - https://proxy.19890605.xyz/raw.githubusercontent.com/YangRucheng/Config-Backup/refs/heads/main/scripts/init.sh | bash
 ```
 
+### 覆盖 SSH 公钥
+
+```bash
+wget -q -O - https://proxy.19890605.xyz/raw.githubusercontent.com/YangRucheng/Config-Backup/refs/heads/main/scripts/ssh-key.sh | bash
+```
+
 ### 更新 Cloudflared
 
 ```bash
